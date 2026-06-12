@@ -43,9 +43,7 @@ const gh = async (token, path, opts = {}) => {
 };
 
 // One commit (optionally backdated) holding one OR many files, via the Git Data API.
-// When parentSha is null (empty repo), the commit has no parent and the branch
-// ref is created instead of updated.
-const datedMultiCommit = async (token, repoFull, branch, parentSha, parentTreeSha, files, message, author, dateISO, createRef = false) => {
+const datedMultiCommit = async (token, repoFull, branch, parentSha, parentTreeSha, files, message, author, dateISO) => {
   const tree = [];
   for (const f of files) {
     const blob = await gh(token, `/repos/${repoFull}/git/blobs`, {
@@ -54,11 +52,9 @@ const datedMultiCommit = async (token, repoFull, branch, parentSha, parentTreeSh
     });
     tree.push({ path: f.path, mode: "100644", type: "blob", sha: blob.sha });
   }
-  const treeBody = { tree };
-  if (parentTreeSha) treeBody.base_tree = parentTreeSha;
   const treeObj = await gh(token, `/repos/${repoFull}/git/trees`, {
     method: "POST",
-    body: JSON.stringify(treeBody),
+    body: JSON.stringify({ base_tree: parentTreeSha, tree }),
   });
   const person = dateISO ? { ...author, date: dateISO } : author;
   const commit = await gh(token, `/repos/${repoFull}/git/commits`, {
@@ -66,22 +62,15 @@ const datedMultiCommit = async (token, repoFull, branch, parentSha, parentTreeSh
     body: JSON.stringify({
       message,
       tree: treeObj.sha,
-      parents: parentSha ? [parentSha] : [],
+      parents: [parentSha],
       author: person,
       committer: person,
     }),
   });
-  if (createRef) {
-    await gh(token, `/repos/${repoFull}/git/refs`, {
-      method: "POST",
-      body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: commit.sha }),
-    });
-  } else {
-    await gh(token, `/repos/${repoFull}/git/refs/heads/${branch}`, {
-      method: "PATCH",
-      body: JSON.stringify({ sha: commit.sha }),
-    });
-  }
+  await gh(token, `/repos/${repoFull}/git/refs/heads/${branch}`, {
+    method: "PATCH",
+    body: JSON.stringify({ sha: commit.sha }),
+  });
   return { commitSha: commit.sha, treeSha: treeObj.sha };
 };
 
@@ -209,7 +198,6 @@ export default function GitPushMobile() {
   const [repo, setRepo] = useState(null);
   const [branches, setBranches] = useState([]);
   const [branch, setBranch] = useState("");
-  const [repoEmpty, setRepoEmpty] = useState(false);
 
   const [path, setPath] = useState("");
   const [entries, setEntries] = useState([]);
@@ -280,21 +268,10 @@ export default function GitPushMobile() {
   const openRepo = (r) =>
     run(async () => {
       setRepo(r);
-      let br = [];
-      try { br = await gh(token, `/repos/${r.full_name}/branches?per_page=50`); } catch { br = []; }
-      const names = br.map((b) => b.name);
+      const br = await gh(token, `/repos/${r.full_name}/branches?per_page=50`);
+      setBranches(br.map((b) => b.name));
       setBranch(r.default_branch);
-      if (names.length === 0) {
-        // Brand-new repo with no commits yet.
-        setRepoEmpty(true);
-        setBranches([r.default_branch]);
-        setEntries([]);
-        setPath("");
-      } else {
-        setRepoEmpty(false);
-        setBranches(names);
-        await listDir(r, "", r.default_branch);
-      }
+      await listDir(r, "", r.default_branch);
       setStep("files");
     });
 
@@ -336,24 +313,19 @@ export default function GitPushMobile() {
   const upDir = () => run(async () => { await listDir(repo, path.split("/").slice(0, -1).join("/"), branch); });
 
   const getHead = async () => {
-    if (repoEmpty) return { sha: null, treeSha: null, empty: true };
     const ref = await gh(token, `/repos/${repo.full_name}/git/ref/heads/${branch}`);
     const head = await gh(token, `/repos/${repo.full_name}/git/commits/${ref.object.sha}`);
-    return { sha: ref.object.sha, treeSha: head.tree.sha, empty: false };
+    return { sha: ref.object.sha, treeSha: head.tree.sha };
   };
 
   const commit = () =>
     run(async () => {
       const msg = message || (fileSha ? `Update ${filePath}` : `Add ${filePath}`);
-      // Backdated, OR first commit into an empty repo, must go through the Git Data API.
-      if ((backdate && startDate) || repoEmpty) {
+      if (backdate && startDate) {
         const head = await getHead();
         const out = await datedMultiCommit(token, repo.full_name, branch, head.sha, head.treeSha,
-          [{ path: filePath, base64: b64encode(content) }], msg, author(),
-          backdate && startDate ? new Date(startDate).toISOString() : null, head.empty);
+          [{ path: filePath, base64: b64encode(content) }], msg, author(), new Date(startDate).toISOString());
         setResult({ sha: out.commitSha, url: `https://github.com/${repo.full_name}/commit/${out.commitSha}`, path: filePath });
-        setFileSha(out.commitSha ? null : fileSha);
-        setRepoEmpty(false);
       } else {
         const body = { message: msg, content: b64encode(content), branch };
         if (fileSha) body.sha = fileSha;
@@ -363,7 +335,7 @@ export default function GitPushMobile() {
       }
     });
 
-  const backToFiles = () => run(async () => { setResult(null); if (!repoEmpty) await listDir(repo, path, branch); setStep("files"); });
+  const backToFiles = () => run(async () => { setResult(null); await listDir(repo, path, branch); setStep("files"); });
 
   // ---------- bulk ----------
   const openBulk = () => {
@@ -445,8 +417,7 @@ export default function GitPushMobile() {
     const status = execPlan.map(() => ({ status: "pending", sha: null }));
     setCommitStatus([...status]);
     try {
-      let { sha: parent, treeSha, empty } = await getHead();
-      let createRef = empty;
+      let { sha: parent, treeSha } = await getHead();
       for (let i = 0; i < execPlan.length; i++) {
         if (cancelRef.current) break;
         status[i] = { status: "pushing", sha: null };
@@ -459,10 +430,9 @@ export default function GitPushMobile() {
             filesB64.push({ path: targetPath, base64: bufToB64(buf) });
           }
           const out = await datedMultiCommit(token, repo.full_name, branch, parent, treeSha,
-            filesB64, execPlan[i].message, author(), execPlan[i].dateISO, createRef);
+            filesB64, execPlan[i].message, author(), execPlan[i].dateISO);
           parent = out.commitSha;
           treeSha = out.treeSha;
-          createRef = false;
           status[i] = { status: "done", sha: out.commitSha };
           setCommitStatus([...status]);
         } catch (e) {
@@ -472,7 +442,6 @@ export default function GitPushMobile() {
         }
         await new Promise((r) => setTimeout(r, 250));
       }
-      setRepoEmpty(false);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -554,16 +523,9 @@ export default function GitPushMobile() {
     screen = (
       <div>
         <p style={{ color: C.muted, fontSize: 12, margin: "4px 0 10px", wordBreak: "break-all" }}>{repo.full_name} <span style={{ color: C.line }}>/</span> <span style={{ color: C.text }}>{path || "(root)"}</span></p>
-        {repoEmpty && (
-          <div style={{ border: `1px solid ${C.amber}`, background: `${C.amber}14`, color: C.amber, borderRadius: 8, padding: "10px 12px", fontSize: 12.5, lineHeight: 1.6, marginBottom: 12 }}>
-            This repo is empty. Your first push — a new file or a folder — will create the <b>{branch}</b> branch and the initial commit.
-          </div>
-        )}
-        {!repoEmpty && (
-          <select style={{ ...inputStyle, marginBottom: 12 }} value={branch} onChange={(e) => changeBranch(e.target.value)}>
-            {branches.map((b) => <option key={b} value={b}>⎇ {b}</option>)}
-          </select>
-        )}
+        <select style={{ ...inputStyle, marginBottom: 12 }} value={branch} onChange={(e) => changeBranch(e.target.value)}>
+          {branches.map((b) => <option key={b} value={b}>⎇ {b}</option>)}
+        </select>
         <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
           <button style={{ ...btnStyle(false), flex: 1 }} onClick={() => setStep("repos")} disabled={busy}>← repos</button>
           {path && <button style={{ ...btnStyle(false), flex: 1 }} onClick={upDir} disabled={busy}>↑ up</button>}
@@ -576,7 +538,6 @@ export default function GitPushMobile() {
             <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.name}</span>
           </button>
         ))}
-        {repoEmpty && <p style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>No files yet — add one above.</p>}
       </div>
     );
   } else if (step === "editor") {
