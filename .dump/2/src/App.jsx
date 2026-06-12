@@ -75,52 +75,15 @@ const datedMultiCommit = async (token, repoFull, branch, parentSha, parentTreeSh
 };
 
 // ---------- planning (pure) ----------
-// Rule-based conventional-commit message generator. No API, runs instantly.
-const stripExt = (n) => n.replace(/\.[^.]+$/, "");
-const titleize = (s) => s.replace(/[-_]/g, " ").trim();
-const COMPONENT_EXT = /\.(jsx|tsx|vue|svelte)$/i;
-const GENERIC_DIR = /^(src|app|lib|public|root|dist|out|tests?|docs?|styles?|assets|static|config)$/i;
-
-const classify = (name) => {
-  const n = name.toLowerCase();
-  if (/(\.test\.|\.spec\.|(^|\/)__tests__\/|(^|\/)tests?\/)/.test(n)) return "test";
-  if (/(^|\/)readme|\.md$|\.mdx$|\.rst$|(^|\/)docs?\//.test(n)) return "docs";
-  if (/\.(css|scss|sass|less|styl)$/.test(n)) return "style";
-  if (/(package(-lock)?\.json|tsconfig|jsconfig|\.ya?ml$|\.toml$|\.ini$|dockerfile|\.config\.|\.env|\.gitignore|vite\.|webpack|rollup|babel|eslint|prettier)/.test(n)) return "chore";
-  if (/\.(png|jpe?g|gif|svg|webp|ico|avif|woff2?|ttf|otf|eot|mp4|mp3|wav)$/.test(n)) return "chore";
-  if (/\.(sql|prisma)$|migration/.test(n)) return "feat";
-  return "feat";
-};
-
 const heuristicMsg = (paths) => {
   const names = paths.map((p) => p.split("/").pop());
   const dirs = paths.map((p) => p.split("/").slice(0, -1).join("/"));
   const commonDir = dirs.every((d) => d === dirs[0]) ? dirs[0] : "";
-  const scope = commonDir ? commonDir.split("/").filter(Boolean).pop() : "";
-  const scoped = scope && !GENERIC_DIR.test(scope);
-  const scopePart = scoped ? `(${scope})` : "";
-
-  const counts = {};
-  paths.forEach((p) => { const t = classify(p); counts[t] = (counts[t] || 0) + 1; });
-  const type = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
-
-  if (paths.length === 1) {
-    const t = classify(paths[0]);
-    const base = titleize(stripExt(names[0]).replace(/\.(test|spec)$/i, ""));
-    if (t === "docs") return `docs${scopePart}: update ${base}`;
-    if (t === "test") return `test${scopePart}: add ${base} tests`;
-    if (t === "chore") return `chore${scopePart}: add ${names[0]}`;
-    if (t === "style") return `style${scopePart}: add ${base} styles`;
-    if (COMPONENT_EXT.test(names[0])) return `feat${scopePart}: add ${base} component`;
-    return `feat${scopePart}: add ${base}`;
-  }
-  if (scoped) {
-    const verb = type === "docs" ? "update" : "add";
-    return `${type}(${scope}): ${verb} ${titleize(scope)} (${paths.length} files)`;
-  }
-  const shown = names.slice(0, 2).map((n) => titleize(stripExt(n))).join(", ");
-  const more = names.length > 2 ? ` +${names.length - 2}` : "";
-  return `${type}: add ${shown}${more}`;
+  const label = commonDir ? commonDir.split("/").pop() : "";
+  if (paths.length === 1) return `Add ${names[0]}`;
+  const shown = names.slice(0, 3).join(", ");
+  const more = names.length > 3 ? ` (+${names.length - 3} more)` : "";
+  return label ? `Add ${label}: ${shown}${more}` : `Add ${shown}${more}`;
 };
 
 // Partition files into commit groups + assign dates + messages.
@@ -366,42 +329,26 @@ export default function GitPushMobile() {
     e.target.value = "";
   };
 
-  // Optional AI polish — calls the serverless function at /api/messages.
-  // The built-in messages are already good; this just refines them.
-  // Retries on transient overload (429/503) with backoff.
+  // AI commit messages — calls the serverless function at /api/messages,
+  // which holds the Anthropic key server-side so the browser never sees it.
   const genMessages = async () => {
     if (!plan.length) return;
     setGenning(true);
     setError("");
-    const groups = plan.map((c) => c.files.map((f) => f.rel));
-    const attempt = async () => {
+    try {
+      const groups = plan.map((c) => c.files.map((f) => f.rel));
       const res = await fetch("/api/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ groups }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const err = new Error(data.error || `server error (${res.status})`);
-        err.retryable = res.status === 429 || res.status === 503;
-        throw err;
-      }
-      return data.messages;
-    };
-    try {
-      let arr, lastErr;
-      for (let i = 0; i < 3; i++) {
-        try { arr = await attempt(); break; }
-        catch (e) {
-          lastErr = e;
-          if (!e.retryable || i === 2) throw e;
-          await new Promise((r) => setTimeout(r, 1200 * (i + 1)));
-        }
-      }
-      if (!Array.isArray(arr) || arr.length !== groups.length) throw lastErr || new Error("unexpected response shape");
+      if (!res.ok) throw new Error(data.error || `server error (${res.status})`);
+      const arr = data.messages;
+      if (!Array.isArray(arr) || arr.length !== groups.length) throw new Error("unexpected response shape");
       setAiMsgs(arr.map(String));
     } catch (e) {
-      setError("AI refine unavailable right now — using the built-in messages, which are ready to push. " + (e.message || ""));
+      setError("Couldn't generate AI messages — keeping the auto ones. " + (e.message || ""));
     } finally {
       setGenning(false);
     }
@@ -622,12 +569,9 @@ export default function GitPushMobile() {
               </div>
             )}
 
-            <button style={{ ...btnStyle(false), borderColor: C.amber, color: C.amber, marginBottom: 4 }} onClick={genMessages} disabled={genning || busy || M === 0}>
-              {genning ? "refining…" : aiMsgs ? "✨ refine again with AI" : "✨ refine with AI (optional)"}
+            <button style={{ ...btnStyle(false), borderColor: C.amber, color: C.amber, marginBottom: 12 }} onClick={genMessages} disabled={genning || busy || M === 0}>
+              {genning ? "generating…" : aiMsgs ? "✨ regenerate messages with Claude" : "✨ generate meaningful messages with Claude"}
             </button>
-            <p style={{ fontSize: 11, color: C.muted, lineHeight: 1.6, margin: "0 0 12px" }}>
-              Messages below are ready to push as-is. AI refine is optional and needs a key configured.
-            </p>
 
             <div style={{ border: `1px solid ${backdate ? C.amber : C.line}`, borderRadius: 8, padding: "12px 14px", marginBottom: 12, background: backdate ? `${C.amber}0D` : "transparent" }}>
               <label style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 14, cursor: "pointer" }}>
