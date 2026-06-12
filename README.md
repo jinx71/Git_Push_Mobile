@@ -16,16 +16,18 @@ messages.
 
 ## Enable AI commit messages (optional)
 The ✨ button calls a serverless function at `api/messages.js` that talks to the
-Anthropic API. For it to work on your deployment:
+Gemini API. For it to work on your deployment:
 
-1. Get an API key from console.anthropic.com.
+1. Get a free API key from aistudio.google.com/apikey.
 2. In Vercel → your project → Settings → Environment Variables, add:
-   `ANTHROPIC_API_KEY = sk-ant-...`
+   `GEMINI_API_KEY = AIza...`
 3. Redeploy.
+
+Gemini's free tier covers this use case, so you likely won't be charged.
 
 Without the key the app still works — it falls back to auto-generated messages
 derived from your file paths.
 
 ## Notes
 - Your GitHub token is entered at runtime and kept only in browser memory.
-- The Anthropic key lives only in Vercel's server env, never in the browser.
+- The Gemini key lives only in Vercel's server env, never in the browser.

@@ -329,32 +329,23 @@ export default function GitPushMobile() {
     e.target.value = "";
   };
 
-  // AI commit messages via the Anthropic API (Claude-in-Claude)
+  // AI commit messages — calls the serverless function at /api/messages,
+  // which holds the Anthropic key server-side so the browser never sees it.
   const genMessages = async () => {
     if (!plan.length) return;
     setGenning(true);
     setError("");
     try {
       const groups = plan.map((c) => c.files.map((f) => f.rel));
-      const prompt =
-        `Write a concise, meaningful git commit message for each of the ${groups.length} file groups below. ` +
-        `Use conventional-commit style (e.g. "feat: add login form", "docs: update readme", "chore: add config"). ` +
-        `Infer intent from the file paths. Respond with ONLY a JSON array of exactly ${groups.length} strings — no markdown, no preamble.\n\n` +
-        groups.map((g, i) => `Group ${i + 1}: ${g.join(", ")}`).join("\n");
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("/api/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 1000,
-          messages: [{ role: "user", content: prompt }],
-        }),
+        body: JSON.stringify({ groups }),
       });
-      const data = await res.json();
-      const text = (data.content || []).map((i) => (i.type === "text" ? i.text : "")).join("");
-      const clean = text.replace(/```json|```/g, "").trim();
-      const arr = JSON.parse(clean);
-      if (!Array.isArray(arr) || arr.length !== groups.length) throw new Error("unexpected length");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `server error (${res.status})`);
+      const arr = data.messages;
+      if (!Array.isArray(arr) || arr.length !== groups.length) throw new Error("unexpected response shape");
       setAiMsgs(arr.map(String));
     } catch (e) {
       setError("Couldn't generate AI messages — keeping the auto ones. " + (e.message || ""));
