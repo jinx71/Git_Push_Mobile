@@ -85,24 +85,6 @@ const datedMultiCommit = async (token, repoFull, branch, parentSha, parentTreeSh
   return { commitSha: commit.sha, treeSha: treeObj.sha };
 };
 
-// Single-file commit via the Contents API. This is the ONLY way to create the
-// first commit in an empty repo (the Git Data API returns 409 there). Supports
-// author/committer dates, so it also covers a backdated first commit.
-const contentsCommit = async (token, repoFull, branch, path, base64, message, author, dateISO, sha = null) => {
-  const body = { message, content: base64, branch };
-  if (sha) body.sha = sha;
-  if (dateISO) {
-    const person = { name: author.name, email: author.email, date: dateISO };
-    body.author = person;
-    body.committer = person;
-  }
-  const data = await gh(token, `/repos/${repoFull}/contents/${encodeURI(path)}`, {
-    method: "PUT",
-    body: JSON.stringify(body),
-  });
-  return { commitSha: data.commit.sha, fileSha: data.content.sha };
-};
-
 // ---------- planning (pure) ----------
 // Rule-based conventional-commit message generator. No API, runs instantly.
 const stripExt = (n) => n.replace(/\.[^.]+$/, "");
@@ -363,20 +345,15 @@ export default function GitPushMobile() {
   const commit = () =>
     run(async () => {
       const msg = message || (fileSha ? `Update ${filePath}` : `Add ${filePath}`);
-      const dateISO = backdate && startDate ? new Date(startDate).toISOString() : null;
-      // Empty repos must be initialized via the Contents API. It supports author
-      // dates, so it also covers a backdated first commit.
-      if (repoEmpty) {
-        const out = await contentsCommit(token, repo.full_name, branch, filePath, b64encode(content), msg, author(), dateISO);
-        setResult({ sha: out.commitSha, url: `https://github.com/${repo.full_name}/commit/${out.commitSha}`, path: filePath });
-        setFileSha(out.fileSha);
-        setRepoEmpty(false);
-        setBranches((b) => (b.length ? b : [branch]));
-      } else if (dateISO) {
+      // Backdated, OR first commit into an empty repo, must go through the Git Data API.
+      if ((backdate && startDate) || repoEmpty) {
         const head = await getHead();
         const out = await datedMultiCommit(token, repo.full_name, branch, head.sha, head.treeSha,
-          [{ path: filePath, base64: b64encode(content) }], msg, author(), dateISO, false);
+          [{ path: filePath, base64: b64encode(content) }], msg, author(),
+          backdate && startDate ? new Date(startDate).toISOString() : null, head.empty);
         setResult({ sha: out.commitSha, url: `https://github.com/${repo.full_name}/commit/${out.commitSha}`, path: filePath });
+        setFileSha(out.commitSha ? null : fileSha);
+        setRepoEmpty(false);
       } else {
         const body = { message: msg, content: b64encode(content), branch };
         if (fileSha) body.sha = fileSha;
@@ -467,42 +444,26 @@ export default function GitPushMobile() {
     cancelRef.current = false;
     const status = execPlan.map(() => ({ status: "pending", sha: null }));
     setCommitStatus([...status]);
-    const prefix = (rel) => (bulkPrefix ? bulkPrefix.replace(/\/+$/, "") + "/" : "") + rel;
-    const toB64 = async (item) => bufToB64(await item.file.arrayBuffer());
     try {
       let { sha: parent, treeSha, empty } = await getHead();
+      let createRef = empty;
       for (let i = 0; i < execPlan.length; i++) {
         if (cancelRef.current) break;
         status[i] = { status: "pushing", sha: null };
         setCommitStatus([...status]);
         try {
-          const grp = execPlan[i];
-          if (empty && i === 0) {
-            // Empty repo: the Git Data API can't create the first commit, so
-            // initialize the repo (and branch) with the Contents API. The first
-            // file bootstraps it; any remaining files in this group are added on
-            // top so the group still lands as intended.
-            const first = grp.files[0];
-            const boot = await contentsCommit(token, repo.full_name, branch, prefix(first.rel), await toB64(first), grp.message, author(), grp.dateISO);
-            parent = boot.commitSha;
-            const hc = await gh(token, `/repos/${repo.full_name}/git/commits/${boot.commitSha}`);
-            treeSha = hc.tree.sha;
-            if (grp.files.length > 1) {
-              const rest = [];
-              for (const item of grp.files.slice(1)) rest.push({ path: prefix(item.rel), base64: await toB64(item) });
-              const outR = await datedMultiCommit(token, repo.full_name, branch, parent, treeSha, rest, grp.message, author(), grp.dateISO, false);
-              parent = outR.commitSha;
-              treeSha = outR.treeSha;
-            }
-            status[i] = { status: "done", sha: boot.commitSha };
-          } else {
-            const filesB64 = [];
-            for (const item of grp.files) filesB64.push({ path: prefix(item.rel), base64: await toB64(item) });
-            const out = await datedMultiCommit(token, repo.full_name, branch, parent, treeSha, filesB64, grp.message, author(), grp.dateISO, false);
-            parent = out.commitSha;
-            treeSha = out.treeSha;
-            status[i] = { status: "done", sha: out.commitSha };
+          const filesB64 = [];
+          for (const item of execPlan[i].files) {
+            const buf = await item.file.arrayBuffer();
+            const targetPath = (bulkPrefix ? bulkPrefix.replace(/\/+$/, "") + "/" : "") + item.rel;
+            filesB64.push({ path: targetPath, base64: bufToB64(buf) });
           }
+          const out = await datedMultiCommit(token, repo.full_name, branch, parent, treeSha,
+            filesB64, execPlan[i].message, author(), execPlan[i].dateISO, createRef);
+          parent = out.commitSha;
+          treeSha = out.treeSha;
+          createRef = false;
+          status[i] = { status: "done", sha: out.commitSha };
           setCommitStatus([...status]);
         } catch (e) {
           status[i] = { status: "failed", sha: null };
